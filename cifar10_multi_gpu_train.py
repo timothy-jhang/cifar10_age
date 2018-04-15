@@ -51,7 +51,7 @@ tf.app.flags.DEFINE_string('train_dir', './cifar10_train',
                            """and checkpoint.""")
 tf.app.flags.DEFINE_integer('max_steps', 200000,
                             """Number of batches to run.""")
-tf.app.flags.DEFINE_integer('num_gpus', 4,
+tf.app.flags.DEFINE_integer('num_gpus', 6,
                             """How many GPUs to use.""")
 tf.app.flags.DEFINE_boolean('log_device_placement', False,
                             """Whether to log device placement.""")
@@ -80,6 +80,25 @@ def tower_loss(scope, images, labels):
 
   # Assemble all of the losses for the current tower only.
   losses = tf.get_collection('losses', scope)
+
+  # to calculate accuracy for batch 
+  top_k_op = tf.nn.in_top_k(logits, labels, 1)
+  top_k_op = tf.cast(top_k_op, tf.int32)
+  acc_batch = tf.reduce_sum(top_k_op)
+  tf.summary.scalar(name="acc_batch", tensor=acc_batch/FLAGS.batch_size)
+
+  # 1-off accuracy for batch
+  print('labels = ', labels)
+  labels = tf.cast(labels, tf.int64)
+  #tf.summary.text(name="labels",tensor=tf.as_string(labels))
+  #tf.summary.text(name="logits",tensor=tf.as_string(logits))
+  argmaxlogits = tf.argmax(logits,axis=-1)
+  #tf.summary.text(name="argmaxlogits ",tensor=tf.as_string(argmaxlogits ))
+  print('>> argmaxlogits = ', argmaxlogits)
+  absdiff=(tf.abs(labels-argmaxlogits) <= 1)
+  #tf.summary.text(name="absdiff", tensor=tf.as_string(absdiff))
+  acc_1off = tf.reduce_sum(tf.cast(absdiff, tf.int64))
+  tf.summary.scalar(name="acc_1off", tensor=acc_1off/FLAGS.batch_size)
 
   # Calculate the total loss for the current tower.
   total_loss = tf.add_n(losses, name='total_loss')
@@ -178,6 +197,9 @@ def train():
             # Retain the summaries from the final tower.
             summaries = tf.get_collection(tf.GraphKeys.SUMMARIES, scope)
 
+	    # tensorboard display : learning rate, accuracy for batch, 1-off accuracy for batch
+            summaries.append(tf.summary.scalar('learning_rate', lr))
+
             # Calculate the gradients for the batch of data on this CIFAR tower.
             grads = opt.compute_gradients(loss)
 
@@ -224,10 +246,8 @@ def train():
     # True to build towers on GPU, as some of the ops do not have GPU
     # implementations.
     #gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=0.4,allocator_type='BFC',allow_growth=True)
-    gpu_options = tf.GPUOptions(allocator_type='BFC',allow_growth=True)
-    sess = tf.Session(config=tf.ConfigProto(
-        allow_soft_placement=True,gpu_options=gpu_options,
-        log_device_placement=FLAGS.log_device_placement))
+    gpu_options = tf.GPUOptions(allow_growth=True)
+    sess = tf.Session(config=tf.ConfigProto(allow_soft_placement=True,gpu_options=gpu_options))
     sess.run(init)
 
     # Start the queue runners.
