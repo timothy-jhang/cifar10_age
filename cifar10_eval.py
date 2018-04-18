@@ -45,18 +45,19 @@ tf.app.flags.DEFINE_string('eval_dir', './cifar10_eval',
                            """Directory where to write event logs.""")
 tf.app.flags.DEFINE_string('eval_data', 'test',
                            """Either 'test' or 'train_eval'.""")
-tf.app.flags.DEFINE_string('checkpoint_dir', './cifar10_train_0.01_256_rgb',
+#tf.app.flags.DEFINE_string('checkpoint_dir', './cifar10_train_0.01_256_hsv',
+tf.app.flags.DEFINE_string('checkpoint_dir', './cifar10_train',
                            """Directory where to read model checkpoints.""")
 #tf.app.flags.DEFINE_integer('eval_interval_secs',  60*5,
 tf.app.flags.DEFINE_integer('eval_interval_secs',  5,
                             """How often to run the eval.""")
-tf.app.flags.DEFINE_integer('num_examples', 10000,
+tf.app.flags.DEFINE_integer('num_examples', 20000,
                             """Number of examples to run.""")
 tf.app.flags.DEFINE_boolean('run_once', False,
                          """Whether to run eval only once.""")
 
 
-def eval_once(saver, summary_writer, top_k_op, summary_op):
+def eval_once(sess, saver, summary_writer, top_k_op, acc_1off, summary_op, global_step, coord):
   """Run Eval once.
   Args:
     saver: Saver.
@@ -64,51 +65,25 @@ def eval_once(saver, summary_writer, top_k_op, summary_op):
     top_k_op: Top K op.
     summary_op: Summary op.
   """
-  gpu_options = tf.GPUOptions(allocator_type='BFC',allow_growth=True)
-  with tf.Session(config=tf.ConfigProto( allow_soft_placement=True,gpu_options=gpu_options) ) as sess:
-    ckpt = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
-    if ckpt and ckpt.model_checkpoint_path:
-      # Restores from checkpoint
-      saver.restore(sess, ckpt.model_checkpoint_path)
-      # Assuming model_checkpoint_path looks something like:
-      #   /my-favorite-path/cifar10_train/model.ckpt-0,
-      # extract global_step from it.
-      global_step = ckpt.model_checkpoint_path.split('/')[-1].split('-')[-1]
-    else:
-      print('No checkpoint file found')
-      return
 
-    # Start the queue runners.
-    coord = tf.train.Coordinator()
-    try:
-      threads = []
-      for qr in tf.get_collection(tf.GraphKeys.QUEUE_RUNNERS):
-        threads.extend(qr.create_threads(sess, coord=coord, daemon=True,
-                                         start=True))
-
-      num_iter = int(math.ceil(FLAGS.num_examples / FLAGS.batch_size))
-      true_count = 0  # Counts the number of correct predictions.
-      total_sample_count = num_iter * FLAGS.batch_size
-      step = 0
-      while step < num_iter and not coord.should_stop():
-        predictions = sess.run([top_k_op])
-        true_count += np.sum(predictions)
-        step += 1
-
+  num_iter = int(math.ceil(FLAGS.num_examples / FLAGS.batch_size))
+  true_count = 0  # Counts the number of correct predictions.
+  oneoff_count=0
+  total_sample_count = num_iter * FLAGS.batch_size
+  step = 0
+  print('num_iter=', num_iter)
+  while (step < num_iter) :
+    predictions, acc_1off_cnt, summary = sess.run([top_k_op,acc_1off, summary_op])
+    true_count += np.sum(predictions)
+    oneoff_count += acc_1off_cnt
+    step += 1
+    summary_writer.add_summary(summary, step)
       # Compute precision @ 1.
-      precision = true_count / total_sample_count
-      print('%s: precision @ 1 = %.3f' % (datetime.now(), precision))
-
-      summary = tf.Summary()
-      summary.ParseFromString(sess.run(summary_op))
-      summary.value.add(tag='Precision @ 1', simple_value=precision)
-      summary_writer.add_summary(summary, global_step)
-    except Exception as e:  # pylint: disable=broad-except
-      coord.request_stop(e)
-
-    coord.request_stop()
-    coord.join(threads, stop_grace_period_secs=10)
-
+  precision = true_count / total_sample_count
+  print('%s: precision @ 1 = %.3f' % (datetime.now(), precision))
+  acc_1off_ratio = oneoff_count / total_sample_count
+  print('%s: 1-off accuracy @ 1 = %.3f' % (datetime.now(), acc_1off_ratio))
+  return precision, acc_1off_ratio
 
 def evaluate():
   """Eval CIFAR-10 for a number of steps."""
@@ -126,8 +101,23 @@ def evaluate():
 #   print('>>>>> input resized = ',images)
     logits = cifar10.inference(images,1.0)
 
-    # Calculate predictions.
+    # Calculate accuracy.
     top_k_op = tf.nn.in_top_k(logits, labels, 1)
+    top_k_op = tf.cast(top_k_op, tf.int32)
+    acc_batch = tf.reduce_sum(top_k_op)
+    tf.summary.scalar(name="acc_batch", tensor=acc_batch/FLAGS.batch_size)
+
+    # 1-off accuracy for batch
+    print('labels = ', labels)
+    labels = tf.cast(labels, tf.int64)
+    #tf.summary.text(name="labels", tensor=tf.as_string(labels))
+    argmaxlogits = tf.argmax(logits,axis=-1)
+    #tf.summary.text(name="argmaxlogits", tensor=tf.as_string(argmaxlogits))
+    print('>> argmaxlogits = ', argmaxlogits)
+    absdiff=(tf.abs(labels-argmaxlogits) <= 1)
+    #tf.summary.text(name="absdiff", tensor=tf.as_string(absdiff))
+    acc_1off = tf.reduce_sum(tf.cast(absdiff, tf.int64))
+    tf.summary.scalar(name="acc_1off", tensor=acc_1off/FLAGS.batch_size)
 
     # Restore the moving average version of the learned variables for eval.
     variable_averages = tf.train.ExponentialMovingAverage(
@@ -140,11 +130,41 @@ def evaluate():
 
     summary_writer = tf.summary.FileWriter(FLAGS.eval_dir, g)
 
-    while True:
-      eval_once(saver, summary_writer, top_k_op, summary_op)
-      if FLAGS.run_once:
-        break
-      time.sleep(FLAGS.eval_interval_secs)
+    gpu_options = tf.GPUOptions(allocator_type='BFC',allow_growth=True)
+    with tf.Session(config=tf.ConfigProto( allow_soft_placement=True,gpu_options=gpu_options) ) as sess:
+      ckpt = tf.train.get_checkpoint_state(FLAGS.checkpoint_dir)
+      if ckpt and ckpt.model_checkpoint_path:
+        # Restores from checkpoint
+        saver.restore(sess, ckpt.model_checkpoint_path)
+        # Assuming model_checkpoint_path looks something like:
+        #   /my-favorite-path/cifar10_train/model.ckpt-0,
+        # extract global_step from it.
+        global_step = ckpt.model_checkpoint_path.split('/')[-1].split('-')[-1]
+      else:
+        print('No checkpoint file found')
+        return
+
+      # Creates a variable to hold the global_step.
+      global_step = tf.get_variable('global_step', [], initializer=tf.constant_initializer(0), trainable=False)
+
+
+      coord = tf.train.Coordinator()
+      # Start the queue runners.
+      threads = []
+      for qr in tf.get_collection(tf.GraphKeys.QUEUE_RUNNERS):
+        threads.extend(qr.create_threads(sess, coord=coord, daemon=True,
+                                       start=True))
+      try:
+        sumprec = 0.0; sumoneoff = 0.0
+        for i in range(100): # 100 times repetition
+          prec, oneoff = eval_once(sess, saver, summary_writer, top_k_op, acc_1off, summary_op, global_step, coord )
+          print('precision = ', prec, '1off accuracy = ', oneoff )
+          sumprec += prec; sumoneoff += oneoff
+        print('average precision = ', sumprec / 100.0, 'average 1off accuracy = ', sumoneoff / 100.0)
+      except Exception as e:  # pylint: disable=broad-except
+        coord.request_stop(e)
+      coord.request_stop()
+      coord.join(threads, stop_grace_period_secs=10)
 
 
 def main(argv=None):  # pylint: disable=unused-argument
